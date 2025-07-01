@@ -1,0 +1,7 @@
+librosa
+opencv-python
+numpy
+moviepy
+matplotlib
+Pillow
+mediapipe
