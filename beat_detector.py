@@ -1,6 +1,4 @@
 import librosa
-from image_animator import generate_frames
-from pose_estimator import get_pose_landmarks
 from PIL import Image
 import numpy as np
 

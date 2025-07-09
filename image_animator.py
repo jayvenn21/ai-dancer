@@ -1,10 +1,8 @@
 import numpy as np
 import cv2
-from PIL import Image
 
-# Define body parts by keypoint indices (extended for better cropping)
 BODY_PARTS = {
-    'head': [0, 1, 2, 3, 7, 4, 5, 6],  # nose, eyes, ears, mouth corners
+    'head': [0, 1, 2, 3, 7],
     'left_upper_arm': [11, 13],
     'left_lower_arm': [13, 15],
     'right_upper_arm': [12, 14],
@@ -13,132 +11,115 @@ BODY_PARTS = {
     'left_lower_leg': [25, 27],
     'right_upper_leg': [24, 26],
     'right_lower_leg': [26, 28],
-    'torso': [11, 12, 23, 24]  # shoulders and hips
+    'torso': [11, 12, 23, 24]
 }
 
-def crop_part(image_np, points, padding=20):
-    # points is a list of tuples (x, y)
-    xs, ys = zip(*points)
-    xmin, xmax = max(min(xs) - padding, 0), min(max(xs) + padding, image_np.shape[1])
-    ymin, ymax = max(min(ys) - padding, 0), min(max(ys) + padding, image_np.shape[0])
+def crop_part(image_np, pt1, pt2, padding=20):
+    x1, y1 = pt1
+    x2, y2 = pt2
+    xmin, xmax = min(x1, x2), max(x1, x2)
+    ymin, ymax = min(y1, y2), max(y1, y2)
+
+    xmin = max(0, xmin - padding)
+    ymin = max(0, ymin - padding)
+    xmax = min(image_np.shape[1], xmax + padding)
+    ymax = min(image_np.shape[0], ymax + padding)
+
     crop = image_np[ymin:ymax, xmin:xmax]
     return crop, (xmin, ymin)
 
-def rotate_image(part_img, angle, pivot):
-    (h, w) = part_img.shape[:2]
-    M = cv2.getRotationMatrix2D(pivot, angle, 1.0)
-    rotated = cv2.warpAffine(part_img, M, (w, h), borderMode=cv2.BORDER_TRANSPARENT)
-    return rotated
+def get_perspective_transform(src_pts, dst_pts):
+    src = np.array(src_pts, dtype=np.float32)
+    dst = np.array(dst_pts, dtype=np.float32)
+    matrix = cv2.getPerspectiveTransform(src, dst)
+    return matrix
 
-def paste_part(canvas, part_img, position):
-    x, y = position
-    h, w = part_img.shape[:2]
+def warp_part(part_img, matrix, dst_shape):
+    warped = cv2.warpPerspective(part_img, matrix, (dst_shape[1], dst_shape[0]), borderMode=cv2.BORDER_TRANSPARENT)
+    return warped
 
-    # Check boundaries
-    if y < 0 or x < 0 or y + h > canvas.shape[0] or x + w > canvas.shape[1]:
-        # Skip parts that go out of bounds
-        return canvas
-
-    # Handle alpha blending if present
-    if part_img.shape[2] == 4:
-        alpha_s = part_img[:, :, 3] / 255.0
-        alpha_l = 1.0 - alpha_s
-        for c in range(3):
-            canvas[y:y+h, x:x+w, c] = (alpha_s * part_img[:, :, c] + alpha_l * canvas[y:y+h, x:x+w, c])
-    else:
-        canvas[y:y+h, x:x+w] = part_img
-    return canvas
-
-def generate_frames(image_np, keypoints, beat_times, fps=30, duration=10):
+def generate_frames(image_np, keypoints_2d, keypoints_3d, beat_times, fps=30, duration=10):
     frames = []
-    beat_frames = set(int(bt * fps) for bt in beat_times)
     total_frames = int(fps * duration)
+    beat_frames = set(int(bt * fps) for bt in beat_times)
 
-    # Pre-crop all parts once
     parts = {}
+    for part_name, idxs in BODY_PARTS.items():
+        pts_2d = [keypoints_2d[i] for i in idxs]
+        xs, ys = zip(*pts_2d)
+        crop, pos = crop_part(image_np, (min(xs), min(ys)), (max(xs), max(ys)), padding=30)
+        parts[part_name] = {
+            'crop': crop,
+            'pos': pos,
+            'original_pts': pts_2d,
+        }
 
-    # Torso
-    torso_pts = [keypoints[i] for i in BODY_PARTS['torso']]
-    torso_crop, torso_pos = crop_part(image_np, torso_pts, padding=40)
-    parts['torso'] = (torso_crop, torso_pos)
-
-    # Head
-    head_pts = [keypoints[i] for i in BODY_PARTS['head']]
-    head_crop, head_pos = crop_part(image_np, head_pts, padding=30)
-    parts['head'] = (head_crop, head_pos)
-
-    # Limbs
-    limbs = [
-        ('left_upper_arm', [11, 13]),
-        ('left_lower_arm', [13, 15]),
-        ('right_upper_arm', [12, 14]),
-        ('right_lower_arm', [14, 16]),
-        ('left_upper_leg', [23, 25]),
-        ('left_lower_leg', [25, 27]),
-        ('right_upper_leg', [24, 26]),
-        ('right_lower_leg', [26, 28]),
-    ]
-
-    for limb_name, indices in limbs:
-        pts = [keypoints[i] for i in indices]
-        crop, pos = crop_part(image_np, pts, padding=30)
-        parts[limb_name] = (crop, pos)
-
-    # For smooth rotation, define a simple sine wave function for angles
-    def angle_for_frame(i, max_angle):
-        # oscillate angle between -max_angle and +max_angle smoothly over time
-        return max_angle * np.sin(2 * np.pi * i / fps * 2)  # 2 Hz oscillation
-
-    for i in range(total_frames):
+    for frame_i in range(total_frames):
         canvas = np.zeros_like(image_np)
 
-        # Determine rotation angles
-        on_beat = i in beat_frames
+        torso_angle = 10 * np.sin(2 * np.pi * (frame_i / total_frames))
+        on_beat = frame_i in beat_frames
 
-        # Head nods a little always, stronger on beat
-        angle_head = angle_for_frame(i, 5) + (10 if on_beat else 0)
+        for part_name, data in parts.items():
+            crop = data['crop']
+            pos_x, pos_y = data['pos']
+            orig_pts_2d = data['original_pts']
+            part_pts_3d = [keypoints_3d[i] for i in BODY_PARTS[part_name]]
 
-        # Arms swing, stronger on beat
-        angle_upper_arm = angle_for_frame(i, 15) * (2 if on_beat else 1)
-        angle_lower_arm = angle_for_frame(i, 10) * (2 if on_beat else 1)
+            angle_deg = 0
+            if part_name == 'torso':
+                angle_deg = torso_angle
+            elif 'arm' in part_name:
+                angle_deg = 20 if on_beat else 0
+                if 'right' in part_name:
+                    angle_deg = -angle_deg
+            elif 'leg' in part_name:
+                angle_deg = 10 * np.sin(2 * np.pi * (frame_i / total_frames))
+            elif part_name == 'head':
+                angle_deg = 5 * np.sin(2 * np.pi * (frame_i / total_frames))
 
-        # Legs kick a little, stronger on beat
-        angle_upper_leg = angle_for_frame(i, 10) * (2 if on_beat else 1)
-        angle_lower_leg = angle_for_frame(i, 7) * (2 if on_beat else 1)
+            angle_rad = np.deg2rad(angle_deg)
+            cos_a = np.cos(angle_rad)
+            sin_a = np.sin(angle_rad)
 
-        # Paste torso (no rotation)
-        torso_crop, torso_pos = parts['torso']
-        canvas = paste_part(canvas, torso_crop, torso_pos)
+            cx, cy, cz = keypoints_3d[11]
 
-        # Paste head rotated around bottom-center (approximate neck)
-        head_crop, head_pos = parts['head']
-        pivot_head = (head_crop.shape[1] // 2, head_crop.shape[0] - 10)
-        rotated_head = rotate_image(head_crop, angle_head, pivot_head)
-        canvas = paste_part(canvas, rotated_head, head_pos)
+            rotated_pts_3d = []
+            for x, y, z in part_pts_3d:
+                dx, dy, dz = x - cx, y - cy, z - cz
+                rx = cos_a * dx + sin_a * dz
+                rz = -sin_a * dx + cos_a * dz
+                rotated_pts_3d.append((cx + rx, cy + dy, cz + rz))
 
-        # Helper to rotate limb around first keypoint
-        def rotate_and_paste(limb_name, angle, keypoint_idx):
-            crop, pos = parts[limb_name]
-            pivot = (keypoints[keypoint_idx][0] - pos[0], keypoints[keypoint_idx][1] - pos[1])
-            rotated = rotate_image(crop, angle, pivot)
-            nonlocal canvas
-            canvas = paste_part(canvas, rotated, pos)
+            dst_pts = [(int(x), int(y)) for x, y, z in rotated_pts_3d]
 
-        # Left arm
-        rotate_and_paste('left_upper_arm', angle_upper_arm, 11)
-        rotate_and_paste('left_lower_arm', angle_lower_arm, 13)
+            h, w = crop.shape[:2]
+            src_pts = [(0, 0), (w, 0), (w, h), (0, h)]
+            if len(dst_pts) >= 4:
+                dst_quad = [dst_pts[0], dst_pts[-1], dst_pts[-2], dst_pts[1]]
+            else:
+                dst_quad = src_pts
 
-        # Right arm
-        rotate_and_paste('right_upper_arm', -angle_upper_arm, 12)  # opposite swing
-        rotate_and_paste('right_lower_arm', -angle_lower_arm, 14)
+            dst_quad_offset = [(x - pos_x, y - pos_y) for x, y in dst_quad]
 
-        # Left leg
-        rotate_and_paste('left_upper_leg', -angle_upper_leg, 23)
-        rotate_and_paste('left_lower_leg', -angle_lower_leg, 25)
+            matrix = get_perspective_transform(src_pts, dst_quad_offset)
+            warped_part = warp_part(crop, matrix, (h, w))
 
-        # Right leg
-        rotate_and_paste('right_upper_leg', angle_upper_leg, 24)
-        rotate_and_paste('right_lower_leg', angle_lower_leg, 26)
+            y1, y2 = pos_y, pos_y + h
+            x1, x2 = pos_x, pos_x + w
+
+            if y1 < 0 or x1 < 0 or y2 > canvas.shape[0] or x2 > canvas.shape[1]:
+                continue
+
+            alpha = warped_part[:, :, 3] / 255.0 if warped_part.shape[2] == 4 else None
+            if alpha is not None:
+                for c in range(3):
+                    canvas[y1:y2, x1:x2, c] = (
+                        alpha * warped_part[:, :, c] +
+                        (1 - alpha) * canvas[y1:y2, x1:x2, c]
+                    )
+            else:
+                canvas[y1:y2, x1:x2] = warped_part
 
         frames.append(canvas)
 
